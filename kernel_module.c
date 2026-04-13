@@ -3,72 +3,116 @@
 #include <linux/init.h>
 #include <linux/list.h>
 #include <linux/sched.h>
+#include <linux/sched/signal.h>
 #include <linux/kthread.h>
-#include <linux/rcupdate.h>
 #include <linux/slab.h>
 #include <linux/delay.h>
-#include <linux/sched/signal.h>
-#include <linux/string.h>
 
 MODULE_LICENSE("GPL");
 
-MODULE_AUTHOR("FuShengyuan");
-
-MODULE_DESCRIPTION("A simple kernel module with a list and two threads.");
-
-static struct list_head my_list;
-static struct task_struct *thread1, *thread2;
-
-spinlock_t lock;
-
-// 定义链表节点结构
-struct pid_node
-{
+struct pid_node {
     int pid;
-    char comm[16];
+    char comm[TASK_COMM_LEN];
     struct list_head list;
 };
 
-// thread1 函数体
+static struct list_head my_list;          // 配合 INIT_LIST_HEAD
+static spinlock_t list_lock;
+static struct task_struct *thread1;
+static struct task_struct *thread2;
+
 static int thread1_func(void *data)
 {
+    struct task_struct *p;
 
-//TODO: add code here
+    for_each_process(p) {
+        struct pid_node *node;
+
+        if (kthread_should_stop())
+            break;
+
+        node = kmalloc(sizeof(*node), GFP_KERNEL);
+        if (!node)
+            continue;
+
+        node->pid = p->pid;
+        strscpy(node->comm, p->comm, TASK_COMM_LEN);
+
+        spin_lock(&list_lock);
+        list_add_tail(&node->list, &my_list); // 文档 5.2.3
+        spin_unlock(&list_lock);
+    }
 
     return 0;
 }
-// thread2 函数体
+
 static int thread2_func(void *data)
 {
+    while (!kthread_should_stop()) {
+        struct pid_node *node = NULL;
 
-//TODO: add code here
+        spin_lock(&list_lock);
+        if (!list_empty(&my_list)) { // 文档 5.2.5
+            node = list_first_entry(&my_list, struct pid_node, list); // 5.2.6
+            list_del(&node->list); // 5.2.4
+        }
+        spin_unlock(&list_lock);
+
+        if (node) {
+            pr_info("pid=%d comm=%s\n", node->pid, node->comm);
+            kfree(node);
+        } else {
+            msleep_interruptible(100); // 文档 5.5
+        }
+    }
 
     return 0;
 }
 
-// 模块初始化函数
-int kernel_module_init(void)
+static int __init kernel_module_init(void)
 {
-    printk(KERN_INFO "List and thread module init\n");
+    // 1) 链表初始化（5.2.1）
+    INIT_LIST_HEAD(&my_list);
+    // 2) 自旋锁初始化（5.4.1）
+    spin_lock_init(&list_lock);
 
-//TODO: add code here
+    // 3) 创建线程（5.3.1）
+    thread1 = kthread_create(thread1_func, NULL, "stu_t1");
+    if (IS_ERR(thread1))
+        return PTR_ERR(thread1);
+
+    thread2 = kthread_create(thread2_func, NULL, "stu_t2");
+    if (IS_ERR(thread2)) {
+        kthread_stop(thread1);
+        return PTR_ERR(thread2);
+    }
+
+    // 4) 唤醒线程（5.3.2）
+    wake_up_process(thread1);
+    wake_up_process(thread2);
+
     return 0;
 }
 
-// 模块清理函数
-void kernel_module_exit(void)
+static void __exit kernel_module_exit(void)
 {
+    struct list_head *pos, *n;
 
-   //TODO: add code here
-    // 停止线程1
+    // 1) 停线程（5.3.3）
+    if (thread1)
+        kthread_stop(thread1);
+    if (thread2)
+        kthread_stop(thread2);
 
-    // 停止线程2
-
-    // 清理链表
- 
-    printk(KERN_INFO "List and thread module exit\n");
+    // 2) 用 list_for_each_safe 清理剩余节点（5.2.7）
+    spin_lock(&list_lock);
+    list_for_each_safe(pos, n, &my_list) {
+        struct pid_node *node = list_entry(pos, struct pid_node, list);
+        list_del(pos);
+        kfree(node);
+    }
+    spin_unlock(&list_lock);
 }
 
 module_init(kernel_module_init);
-
 module_exit(kernel_module_exit);
